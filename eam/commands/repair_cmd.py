@@ -1,6 +1,7 @@
 import re
 import csv
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
 import click
 from tabulate import tabulate
 from ..database import (
@@ -439,3 +440,233 @@ def repair_cost_cmd(date_from, date_to, by_asset, by_month):
         click.echo("\n按月份统计:")
         rows = [[k, f"{v:.2f}"] for k, v in sorted(month_costs.items())]
         click.echo(tabulate(rows, headers=['月份', '费用(元)'], tablefmt='simple'))
+
+
+def _build_repair_ledger(conn, filters=None):
+    """
+    构建维修台账（按资产维度汇总）
+    返回列表，每项包含资产信息和维修统计
+    """
+    if filters is None:
+        filters = {}
+
+    log_filters = {}
+    if filters.get('date_from'):
+        log_filters['date_from'] = filters['date_from']
+    if filters.get('date_to'):
+        log_filters['date_to'] = filters['date_to']
+
+    all_records = _build_repair_records(conn, log_filters)
+
+    asset_filters = {}
+    if filters.get('department'):
+        asset_filters['department'] = filters['department']
+    if filters.get('category'):
+        asset_filters['category'] = filters['category']
+    if filters.get('status'):
+        asset_filters['status'] = filters['status']
+
+    if asset_filters:
+        assets = query_assets(conn, asset_filters)
+        asset_nos = {a['asset_no'] for a in assets}
+        all_records = [r for r in all_records if r['asset_no'] in asset_nos]
+
+    asset_stats = {}
+    for r in all_records:
+        no = r['asset_no']
+        if no not in asset_stats:
+            asset_stats[no] = {
+                'count': 0,
+                'total_cost': 0,
+                'total_days': 0,
+                'days_count': 0,
+                'last_start': None,
+                'last_end': None,
+                'last_cost': 0,
+                'current_status': '无维修记录',
+                'records': [],
+            }
+        s = asset_stats[no]
+        s['count'] += 1
+        s['total_cost'] += r['cost']
+        s['records'].append(r)
+
+        if r['duration_days'] is not None:
+            s['total_days'] += r['duration_days']
+            s['days_count'] += 1
+
+    for no, s in asset_stats.items():
+        s['records'].sort(key=lambda x: x['start_time'], reverse=True)
+        latest = s['records'][0]
+        s['last_start'] = latest['start_time']
+        s['last_end'] = latest['end_time']
+        s['last_cost'] = latest['cost']
+        s['current_status'] = latest['status']
+
+    all_asset_nos = set()
+    if asset_filters:
+        assets = query_assets(conn, asset_filters)
+        all_asset_nos = {a['asset_no']: a for a in assets}
+    else:
+        assets = query_assets(conn, {})
+        all_asset_nos = {a['asset_no']: a for a in assets}
+
+    ledger = []
+    for no in sorted(all_asset_nos.keys()):
+        asset = all_asset_nos[no]
+        if no in asset_stats:
+            s = asset_stats[no]
+            avg_days = s['total_days'] / s['days_count'] if s['days_count'] else 0
+            ledger.append({
+                'asset_no': no,
+                'name': asset['name'],
+                'category': asset['category'],
+                'department': asset['department'] or '',
+                'current_status': s['current_status'],
+                'repair_count': s['count'],
+                'total_cost': s['total_cost'],
+                'last_start': s['last_start'],
+                'last_end': s['last_end'] or '',
+                'last_cost': s['last_cost'],
+                'avg_days': avg_days,
+            })
+        elif filters.get('show_all'):
+            ledger.append({
+                'asset_no': no,
+                'name': asset['name'],
+                'category': asset['category'],
+                'department': asset['department'] or '',
+                'current_status': asset['status'],
+                'repair_count': 0,
+                'total_cost': 0,
+                'last_start': '',
+                'last_end': '',
+                'last_cost': 0,
+                'avg_days': 0,
+            })
+
+    return ledger
+
+
+@click.command('repair-ledger')
+@click.option('--department', '-d', help='按部门筛选')
+@click.option('--category', '-c', help='按类别筛选')
+@click.option('--status', help='按资产当前状态筛选')
+@click.option('--date-from', help='维修开始日期 (YYYY-MM-DD)')
+@click.option('--date-to', help='维修结束日期 (YYYY-MM-DD)')
+@click.option('--show-all', is_flag=True, help='显示所有资产（含无维修记录的）')
+@click.option('--export', '-e', help='导出到文件 (CSV/Excel)')
+@click.option('--format', '-f', 'fmt', type=click.Choice(['simple', 'detailed']),
+              default='simple', help='显示格式')
+def repair_ledger_cmd(department, category, status, date_from, date_to, show_all, export, fmt):
+    """维修台账（按资产汇总，含最近维修信息和历史统计）"""
+    with get_db() as conn:
+        filters = {}
+        if department:
+            filters['department'] = department
+        if category:
+            filters['category'] = category
+        if status:
+            filters['status'] = status
+        if date_from:
+            filters['date_from'] = date_from
+        if date_to:
+            filters['date_to'] = date_to
+        if show_all:
+            filters['show_all'] = True
+
+        ledger = _build_repair_ledger(conn, filters)
+
+    if not ledger:
+        click.echo("没有符合条件的资产")
+        return
+
+    if fmt == 'detailed':
+        headers = ['资产编号', '资产名称', '类别', '部门', '当前状态',
+                   '维修次数', '总费用(元)', '最近开始', '最近完成', '最近费用', '平均周期(天)']
+        rows = []
+        for item in ledger:
+            rows.append([
+                item['asset_no'],
+                item['name'],
+                item['category'],
+                item['department'] or '-',
+                item['current_status'],
+                item['repair_count'],
+                f"{item['total_cost']:.2f}",
+                item['last_start'] or '-',
+                item['last_end'] or '-',
+                f"{item['last_cost']:.2f}" if item['last_cost'] else '-',
+                f"{item['avg_days']:.1f}" if item['avg_days'] else '-',
+            ])
+    else:
+        headers = ['资产编号', '资产名称', '部门', '当前状态', '维修次数', '总费用(元)', '最近开始']
+        rows = []
+        for item in ledger:
+            rows.append([
+                item['asset_no'],
+                item['name'],
+                item['department'] or '-',
+                item['current_status'],
+                item['repair_count'],
+                f"{item['total_cost']:.2f}",
+                item['last_start'] or '-',
+            ])
+
+    click.echo("=" * 80)
+    click.echo("  维修台账")
+    dept_str = f" | 部门: {department}" if department else ""
+    cat_str = f" | 类别: {category}" if category else ""
+    date_str = ""
+    if date_from or date_to:
+        date_str = f" | 区间: {date_from or '开始'} ~ {date_to or '至今'}"
+    click.echo(f"  共 {len(ledger)} 项资产{dept_str}{cat_str}{date_str}")
+    click.echo("=" * 80)
+    click.echo(tabulate(rows, headers=headers, tablefmt='simple'))
+
+    total_count = sum(item['repair_count'] for item in ledger)
+    total_cost = sum(item['total_cost'] for item in ledger)
+    has_repair = sum(1 for item in ledger if item['repair_count'] > 0)
+    click.echo(f"\n有维修记录: {has_repair} 项，总维修次数: {total_count} 次，总费用: {total_cost:.2f} 元")
+
+    if export:
+        ext = os.path.splitext(export)[1].lower()
+        if ext == '.csv':
+            with open(export, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['资产编号', '资产名称', '类别', '部门', '当前状态',
+                                 '维修次数', '总费用(元)', '最近开始时间', '最近完成时间',
+                                 '最近费用(元)', '平均维修周期(天)'])
+                for item in ledger:
+                    writer.writerow([
+                        item['asset_no'], item['name'], item['category'],
+                        item['department'], item['current_status'],
+                        item['repair_count'], f"{item['total_cost']:.2f}",
+                        item['last_start'], item['last_end'],
+                        f"{item['last_cost']:.2f}" if item['last_cost'] else '',
+                        f"{item['avg_days']:.1f}" if item['avg_days'] else '',
+                    ])
+            click.echo(f"\n已导出到 {export}")
+        elif ext in ['.xlsx', '.xls']:
+            try:
+                from openpyxl import Workbook
+                wb = Workbook()
+                ws = wb.active
+                ws.title = '维修台账'
+                ws.append(['资产编号', '资产名称', '类别', '部门', '当前状态',
+                           '维修次数', '总费用(元)', '最近开始时间', '最近完成时间',
+                           '最近费用(元)', '平均维修周期(天)'])
+                for item in ledger:
+                    ws.append([
+                        item['asset_no'], item['name'], item['category'],
+                        item['department'], item['current_status'],
+                        item['repair_count'], item['total_cost'],
+                        item['last_start'], item['last_end'],
+                        item['last_cost'], item['avg_days'],
+                    ])
+                wb.save(export)
+                click.echo(f"\n已导出到 {export}")
+            except ImportError:
+                click.echo("\n错误: 需要安装 openpyxl 才能导出 Excel 文件")
+        else:
+            click.echo(f"\n错误: 不支持的导出格式 {ext}")

@@ -5,7 +5,7 @@ from .commands.list_cmd import list_cmd, view_cmd
 from .commands.assign_cmd import assign_cmd, return_cmd, transfer_cmd
 from .commands.repair_cmd import (
     repair_start_cmd, repair_complete_cmd, repair_list_cmd, repair_cost_cmd,
-    repair_summary_cmd
+    repair_summary_cmd, repair_ledger_cmd
 )
 from .commands.batch_cmd import batch_cmd, batch_template_cmd
 from .commands.move_cmd import move_cmd, remark_cmd
