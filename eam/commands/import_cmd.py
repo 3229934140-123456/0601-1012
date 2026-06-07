@@ -9,6 +9,33 @@ from ..database import (
 )
 
 
+def _calc_merge_update(asset, existing):
+    old_remark = existing['remark'] or ''
+    new_remark = asset.get('remark', '') or ''
+    merged_remark = old_remark
+    updated_fields = []
+
+    if new_remark and new_remark != old_remark:
+        if old_remark:
+            merged_remark = old_remark + '; ' + new_remark
+        else:
+            merged_remark = new_remark
+        updated_fields.append('remark')
+
+    update_data = {}
+    if merged_remark != old_remark:
+        update_data['remark'] = merged_remark
+
+    for key in ['department', 'location', 'user_name']:
+        existing_val = existing[key] if key in existing.keys() else ''
+        asset_val = asset.get(key, '') or ''
+        if asset_val and not existing_val:
+            update_data[key] = asset_val
+            updated_fields.append(key)
+
+    return update_data, updated_fields
+
+
 def _read_csv(filepath):
     assets = []
     with open(filepath, 'r', encoding='utf-8-sig') as f:
@@ -173,42 +200,99 @@ def import_cmd(filepath, dry_run, operator, mode, check_file_dup):
         db_duplicates = []
         new_assets = []
         update_assets = []
+        no_change_assets = []
+        skip_file_dup = []
 
         seen_nos = set()
         deduped_list = []
+        file_dup_details = {}
         for asset in normalized_list:
-            if asset['asset_no'] in seen_nos:
-                continue
-            seen_nos.add(asset['asset_no'])
-            deduped_list.append(asset)
+            no = asset['asset_no']
+            if no in seen_nos:
+                if no not in file_dup_details:
+                    file_dup_details[no] = {'first': None, 'duplicates': []}
+                file_dup_details[no]['duplicates'].append(asset)
+                skip_file_dup.append(asset)
+            else:
+                seen_nos.add(no)
+                deduped_list.append(asset)
+                if no in file_dup_details:
+                    file_dup_details[no]['first'] = asset
 
         for asset in deduped_list:
-            if asset_exists(conn, asset['asset_no']):
+            existing = get_asset_by_no(conn, asset['asset_no'])
+            if existing:
                 db_duplicates.append(asset['asset_no'])
                 if mode == 'merge-remark':
-                    update_assets.append(asset)
+                    update_data, updated_fields = _calc_merge_update(asset, existing)
+                    if update_data:
+                        update_assets.append((asset, existing, update_data, updated_fields))
+                    else:
+                        no_change_assets.append((asset, existing))
             else:
                 new_assets.append(asset)
 
+        if file_duplicates:
+            click.echo()
+            click.echo("=" * 60)
+            click.echo("  文件内部重复明细")
+            click.echo("=" * 60)
+            click.echo(f"  共 {len(file_dup_details)} 个重复编号，{len(skip_file_dup)} 条重复记录将被跳过")
+            click.echo()
+            for no in sorted(file_dup_details.keys()):
+                info = file_dup_details[no]
+                dup_count = len(info['duplicates']) + 1
+                click.echo(f"  {no}: 出现 {dup_count} 次，仅保留首次出现的记录")
+
         if db_duplicates:
-            click.echo(f"\n发现 {len(db_duplicates)} 个与数据库重复的编号:")
+            click.echo()
+            click.echo("=" * 60)
+            click.echo("  数据库重复明细")
+            click.echo("=" * 60)
+            if mode == 'skip':
+                click.echo(f"  模式: 跳过（共 {len(db_duplicates)} 条将被跳过）")
+            elif mode == 'merge-remark':
+                click.echo(f"  模式: 合并备注")
+                click.echo(f"  将更新: {len(update_assets)} 条")
+                if no_change_assets:
+                    click.echo(f"  无变化跳过: {len(no_change_assets)} 条")
+            elif mode == 'abort':
+                click.echo(f"  模式: 中止导入（共 {len(db_duplicates)} 条重复）")
+            click.echo()
             for no in db_duplicates[:10]:
                 click.echo(f"  {no}")
             if len(db_duplicates) > 10:
-                click.echo(f"  ... 还有 {len(db_duplicates) - 10} 个")
+                click.echo(f"  ... 还有 {len(db_duplicates) - 10} 条")
 
             if mode == 'abort':
                 click.echo("\n中止导入（数据库中存在重复编号）")
                 return
 
-        click.echo(f"\n导入统计:")
+        click.echo()
+        click.echo("=" * 60)
+        click.echo("  导入预览汇总")
+        click.echo("=" * 60)
+        click.echo(f"  读取总数: {len(normalized_list)} 条")
+        if file_dup_details:
+            click.echo(f"  文件内重复跳过: {len(skip_file_dup)} 条")
         click.echo(f"  新增资产: {len(new_assets)} 条")
         if mode == 'merge-remark':
             click.echo(f"  更新备注: {len(update_assets)} 条")
+            if no_change_assets:
+                click.echo(f"  无变化跳过: {len(no_change_assets)} 条")
         else:
             click.echo(f"  跳过重复: {len(db_duplicates)} 条")
-        if file_duplicates:
-            click.echo(f"  文件内重复(已去重): {len(file_duplicates)} 个编号")
+        click.echo("=" * 60)
+
+        if new_assets:
+            click.echo("\n新增资产样例 (前5条):")
+            for a in new_assets[:5]:
+                click.echo(f"  {a['asset_no']} - {a.get('name', '')}")
+
+        if mode == 'merge-remark' and update_assets:
+            click.echo("\n将更新备注的资产 (前5条):")
+            for a, _, _, _ in update_assets[:5]:
+                click.echo(f"  {a['asset_no']} - {a.get('name', '')}")
 
         if dry_run:
             click.echo("\n[试运行] 以上为预览结果，未实际写入数据库")
@@ -218,41 +302,7 @@ def import_cmd(filepath, dry_run, operator, mode, check_file_dup):
         updated = 0
         skipped = 0
 
-        for asset in deduped_list:
-            existing = get_asset_by_no(conn, asset['asset_no'])
-            if existing:
-                if mode == 'merge-remark':
-                    old_remark = existing['remark'] or ''
-                    new_remark = asset.get('remark', '') or ''
-                    merged_remark = old_remark
-                    if new_remark:
-                        if old_remark:
-                            merged_remark = old_remark + '; ' + new_remark
-                        else:
-                            merged_remark = new_remark
-
-                    update_data = {'remark': merged_remark}
-                    for key in ['department', 'location', 'user_name']:
-                        if asset.get(key) and not existing.get(key):
-                            update_data[key] = asset[key]
-
-                    if update_data:
-                        update_asset(conn, asset['asset_no'], update_data)
-                        update_asset_timestamp(conn, asset['asset_no'])
-                        log_operation(
-                            conn,
-                            asset['asset_no'],
-                            '导入更新',
-                            operator,
-                            f"合并备注及补全字段: {', '.join(update_data.keys())}"
-                        )
-                        updated += 1
-                    else:
-                        skipped += 1
-                else:
-                    skipped += 1
-                continue
-
+        for asset in new_assets:
             insert_asset(conn, asset)
             log_operation(
                 conn,
@@ -263,7 +313,32 @@ def import_cmd(filepath, dry_run, operator, mode, check_file_dup):
             )
             imported += 1
 
-    click.echo(f"\n导入完成: 新增 {imported} 条，更新 {updated} 条，跳过 {skipped} 条")
+        for asset, existing, update_data, updated_fields in update_assets:
+            update_asset(conn, asset['asset_no'], update_data)
+            update_asset_timestamp(conn, asset['asset_no'])
+            log_operation(
+                conn,
+                asset['asset_no'],
+                '导入更新',
+                operator,
+                f"合并备注及补全字段: {', '.join(updated_fields)}"
+            )
+            updated += 1
+
+        if mode == 'skip':
+            skipped += len(db_duplicates)
+        elif mode == 'merge-remark':
+            skipped += len(no_change_assets)
+
+    click.echo()
+    click.echo("=" * 60)
+    click.echo("  导入完成")
+    click.echo("=" * 60)
+    click.echo(f"  新增: {imported} 条")
+    if mode == 'merge-remark':
+        click.echo(f"  更新备注: {updated} 条")
+    click.echo(f"  跳过: {skipped} 条")
+    click.echo("=" * 60)
 
 
 @click.command('check-duplicates')

@@ -1,10 +1,12 @@
 import os
 import csv
 import click
+from datetime import datetime
 from tabulate import tabulate
 from ..database import (
     get_db, get_asset_by_no, update_asset, log_operation,
-    update_asset_timestamp
+    update_asset_timestamp, create_batch_run, update_batch_run,
+    save_snapshot, get_batch_run, get_batch_snapshots, list_batch_runs
 )
 
 
@@ -286,7 +288,8 @@ def _execute_task(task, asset, conn, operator):
 @click.option('--operator', default='system', help='操作人')
 @click.option('--yes', '-y', is_flag=True, help='跳过确认')
 @click.option('--fail-log', help='失败记录导出文件')
-def batch_cmd(filepath, dry_run, operator, yes, fail_log):
+@click.option('--remark', help='批次备注')
+def batch_cmd(filepath, dry_run, operator, yes, fail_log, remark):
     """批量执行任务（支持分配、归还、移动、报废、备注等）
 
     \b
@@ -395,9 +398,23 @@ def batch_cmd(filepath, dry_run, operator, yes, fail_log):
             click.echo("已取消")
             return
 
+    batch_no = 'B' + datetime.now().strftime('%Y%m%d%H%M%S')
+    success_count = 0
+    exec_failed = []
+
     with get_db() as conn:
-        success_count = 0
-        exec_failed = []
+        create_batch_run(conn, batch_no, operator, len(valid_tasks), remark or '')
+
+        snapshotted = set()
+        for task in valid_tasks:
+            asset_no = task['asset_no']
+            if asset_no in snapshotted:
+                continue
+            asset_row = get_asset_by_no(conn, asset_no)
+            if asset_row:
+                asset_dict = _row_to_dict(asset_row)
+                save_snapshot(conn, batch_no, asset_no, asset_dict)
+                snapshotted.add(asset_no)
 
         for task in valid_tasks:
             asset_row = get_asset_by_no(conn, task['asset_no'])
@@ -414,13 +431,19 @@ def batch_cmd(filepath, dry_run, operator, yes, fail_log):
                 task['_exec_error'] = msg
                 exec_failed.append(task)
 
+        fail_count = len(exec_failed) + len(failed_tasks)
+        update_batch_run(conn, batch_no, success_count, fail_count, 'completed')
+
     total_failed = len(failed_tasks) + len(exec_failed)
 
     click.echo("\n" + "=" * 60)
     click.echo("  执行结果")
     click.echo("=" * 60)
+    click.echo(f"  批次号: {batch_no}")
     click.echo(f"  成功: {success_count} 条")
     click.echo(f"  失败: {total_failed} 条（校验失败 {len(failed_tasks)} + 执行失败 {len(exec_failed)}）")
+    click.echo()
+    click.echo(f"  提示: 使用 batch-rollback {batch_no} 可撤回本次操作")
 
     if exec_failed:
         click.echo("\n执行失败明细:")
@@ -515,3 +538,123 @@ def batch_template_cmd(output):
     click.echo("  remark   - 追加备注 (需 remark)")
     click.echo("  idle     - 标记闲置")
     click.echo("  status   - 变更状态 (需 status)")
+
+
+@click.command('batch-list')
+@click.option('--limit', '-n', type=int, default=10, help='显示最近 N 条')
+def batch_list_cmd(limit):
+    """查看批量任务历史"""
+    with get_db() as conn:
+        runs = list_batch_runs(conn, limit)
+
+    if not runs:
+        click.echo("暂无批量任务记录")
+        return
+
+    rows = []
+    for r in runs:
+        rows.append([
+            r['batch_no'],
+            r['status'],
+            r['operator'] or '-',
+            r['task_count'],
+            r['success_count'] or 0,
+            r['fail_count'] or 0,
+            r['created_at'],
+            r['remark'] or '',
+        ])
+
+    click.echo(tabulate(rows,
+                        headers=['批次号', '状态', '操作人', '任务数', '成功', '失败', '创建时间', '备注'],
+                        tablefmt='simple'))
+
+
+@click.command('batch-rollback')
+@click.argument('batch_no')
+@click.option('--operator', default='system', help='操作人')
+@click.option('--yes', '-y', is_flag=True, help='跳过确认')
+@click.option('--dry-run', is_flag=True, help='预览撤回内容')
+def batch_rollback_cmd(batch_no, operator, yes, dry_run):
+    """撤回批量任务（按批次号恢复资产状态）"""
+    with get_db() as conn:
+        batch = get_batch_run(conn, batch_no)
+        if not batch:
+            click.echo(f"错误: 批次 {batch_no} 不存在")
+            return
+
+        if batch['status'] == 'rolled_back':
+            click.echo(f"警告: 批次 {batch_no} 已经撤回过")
+
+        snapshots = get_batch_snapshots(conn, batch_no)
+        if not snapshots:
+            click.echo("错误: 该批次没有快照数据，无法撤回")
+            return
+
+    if dry_run:
+        click.echo(f"批次 {batch_no} 将撤回 {len(snapshots)} 项资产的变更:")
+        click.echo()
+        rows = []
+        for s in snapshots:
+            before = s['before_data']
+            rows.append([
+                s['asset_no'],
+                before.get('status', ''),
+                before.get('user_name', '') or '',
+                before.get('department', '') or '',
+                before.get('location', '') or '',
+            ])
+        click.echo(tabulate(rows, headers=['资产编号', '原状态', '原使用人', '原部门', '原地点'],
+                            tablefmt='simple'))
+        click.echo(f"\n[预览] 将恢复以上 {len(snapshots)} 项资产到变更前状态")
+        return
+
+    if not yes:
+        click.echo(f"将撤回批次 {batch_no} 的 {len(snapshots)} 项资产变更")
+        if not click.confirm("确认撤回?", default=False):
+            click.echo("已取消")
+            return
+
+    with get_db() as conn:
+        rollback_count = 0
+        for s in snapshots:
+            asset_no = s['asset_no']
+            before = s['before_data']
+
+            existing = get_asset_by_no(conn, asset_no)
+            if not existing:
+                continue
+
+            update_data = {}
+            for key in ['status', 'user_name', 'department', 'location', 'remark', 'depreciation_status']:
+                old_val = before.get(key, '') or ''
+                cur_val = existing[key] if key in existing.keys() else ''
+                if old_val != (cur_val or ''):
+                    update_data[key] = old_val
+
+            if update_data:
+                update_asset(conn, asset_no, update_data)
+                update_asset_timestamp(conn, asset_no)
+                log_operation(
+                    conn,
+                    asset_no,
+                    '撤回',
+                    operator,
+                    f"批次 {batch_no} 撤回，恢复字段: {', '.join(update_data.keys())}"
+                )
+                rollback_count += 1
+
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE batch_runs SET status = 'rolled_back',
+                   completed_at = datetime('now', 'localtime')
+            WHERE batch_no = ?
+        ''', (batch_no,))
+
+    click.echo()
+    click.echo("=" * 60)
+    click.echo("  撤回完成")
+    click.echo("=" * 60)
+    click.echo(f"  批次号: {batch_no}")
+    click.echo(f"  撤回资产: {rollback_count} 项")
+    click.echo(f"  操作人: {operator}")
+    click.echo("=" * 60)

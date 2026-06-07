@@ -7,7 +7,7 @@ from .commands.repair_cmd import (
     repair_start_cmd, repair_complete_cmd, repair_list_cmd, repair_cost_cmd,
     repair_summary_cmd, repair_ledger_cmd
 )
-from .commands.batch_cmd import batch_cmd, batch_template_cmd
+from .commands.batch_cmd import batch_cmd, batch_template_cmd, batch_list_cmd, batch_rollback_cmd
 from .commands.move_cmd import move_cmd, remark_cmd
 from .commands.tag_cmd import (
     tag_cmd, status_cmd, depreciation_cmd, scrap_cmd, idle_cmd
@@ -15,6 +15,7 @@ from .commands.tag_cmd import (
 from .commands.report_cmd import (
     report_cmd, inventory_diff_cmd, history_cmd, export_cmd, monthly_report_cmd
 )
+from .commands.audit_cmd import audit_cmd
 
 
 @click.group()
@@ -53,8 +54,11 @@ cli.add_command(repair_complete_cmd, name='repair-complete')
 cli.add_command(repair_list_cmd, name='repair-list')
 cli.add_command(repair_cost_cmd, name='repair-cost')
 cli.add_command(repair_summary_cmd, name='repair-summary')
+cli.add_command(repair_ledger_cmd, name='repair-ledger')
 cli.add_command(batch_cmd, name='batch')
 cli.add_command(batch_template_cmd, name='batch-template')
+cli.add_command(batch_list_cmd, name='batch-list')
+cli.add_command(batch_rollback_cmd, name='batch-rollback')
 cli.add_command(move_cmd, name='move')
 cli.add_command(remark_cmd, name='remark')
 cli.add_command(tag_cmd, name='tag')
@@ -67,6 +71,7 @@ cli.add_command(inventory_diff_cmd, name='inventory-diff')
 cli.add_command(history_cmd, name='history')
 cli.add_command(export_cmd, name='export')
 cli.add_command(monthly_report_cmd, name='monthly-report')
+cli.add_command(audit_cmd, name='audit')
 
 
 def main():

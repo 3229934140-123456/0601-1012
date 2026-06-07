@@ -80,6 +80,38 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_logs_operation ON operation_logs(operation)
         ''')
 
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS batch_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_no TEXT UNIQUE NOT NULL,
+                operator TEXT,
+                task_count INTEGER DEFAULT 0,
+                success_count INTEGER DEFAULT 0,
+                fail_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                completed_at TEXT,
+                remark TEXT
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS batch_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_no TEXT NOT NULL,
+                asset_no TEXT NOT NULL,
+                before_data TEXT,
+                created_at TEXT DEFAULT (datetime('now', 'localtime'))
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_batch_runs_no ON batch_runs(batch_no)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_batch_snapshots_no ON batch_snapshots(batch_no)
+        ''')
+
 
 def log_operation(conn, asset_no, operation, operator=None, detail=None):
     cursor = conn.cursor()
@@ -212,3 +244,55 @@ def get_asset_statistics(conn):
     stats['total_value'] = cursor.fetchone()['total_value'] or 0
 
     return stats
+
+
+def create_batch_run(conn, batch_no, operator, task_count, remark=''):
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO batch_runs (batch_no, operator, task_count, status, remark)
+        VALUES (?, ?, ?, 'running', ?)
+    ''', (batch_no, operator, task_count, remark))
+    return cursor.lastrowid
+
+
+def update_batch_run(conn, batch_no, success_count, fail_count, status='completed'):
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE batch_runs 
+        SET success_count = ?, fail_count = ?, status = ?,
+            completed_at = datetime('now', 'localtime')
+        WHERE batch_no = ?
+    ''', (success_count, fail_count, status, batch_no))
+
+
+def save_snapshot(conn, batch_no, asset_no, before_data):
+    import json
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO batch_snapshots (batch_no, asset_no, before_data)
+        VALUES (?, ?, ?)
+    ''', (batch_no, asset_no, json.dumps(before_data, ensure_ascii=False)))
+
+
+def get_batch_run(conn, batch_no):
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM batch_runs WHERE batch_no = ?', (batch_no,))
+    return cursor.fetchone()
+
+
+def get_batch_snapshots(conn, batch_no):
+    import json
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM batch_snapshots WHERE batch_no = ?', (batch_no,))
+    snapshots = []
+    for row in cursor.fetchall():
+        snap = {k: row[k] for k in row.keys()}
+        snap['before_data'] = json.loads(snap['before_data']) if snap['before_data'] else {}
+        snapshots.append(snap)
+    return snapshots
+
+
+def list_batch_runs(conn, limit=10):
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM batch_runs ORDER BY created_at DESC LIMIT ?', (limit,))
+    return cursor.fetchall()
