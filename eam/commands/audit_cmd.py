@@ -15,10 +15,11 @@ from ..database import get_db
               multiple=True, help='审计类型，可多选')
 @click.option('--department', '-d', help='按部门筛选')
 @click.option('--category', '-c', help='按类别筛选')
-@click.option('--export', '-e', help='导出到文件 (CSV/Excel)')
+@click.option('--export', '-e', help='导出审计报告 (CSV/Excel)')
+@click.option('--export-todo', help='导出待处理清单 (CSV，可直接用于 batch)')
 @click.option('--format', '-f', 'fmt', type=click.Choice(['csv', 'xlsx']),
               default='csv', help='导出格式')
-def audit_cmd(repair_days, idle_days, audit_types, department, category, export, fmt):
+def audit_cmd(repair_days, idle_days, audit_types, department, category, export, export_todo, fmt):
     """审计异常资产（超期维修、长期闲置、脏数据等）"""
     if not audit_types:
         audit_types = ['all']
@@ -39,16 +40,16 @@ def audit_cmd(repair_days, idle_days, audit_types, department, category, export,
 
     total = sum(len(v) for v in results.values())
 
-    click.echo("=" * 80)
+    click.echo("=" * 90)
     click.echo("  资产审计报告")
-    click.echo("=" * 80)
+    click.echo("=" * 90)
     click.echo(f"  阈值: 维修超期 > {repair_days} 天，长期闲置 > {idle_days} 天")
     if department:
         click.echo(f"  部门: {department}")
     if category:
         click.echo(f"  类别: {category}")
     click.echo(f"  共发现 {total} 项异常")
-    click.echo("=" * 80)
+    click.echo("=" * 90)
     click.echo()
 
     if 'overdue_repair' in results:
@@ -64,6 +65,10 @@ def audit_cmd(repair_days, idle_days, audit_types, department, category, export,
         _export_audit_results(export, fmt, results, repair_days, idle_days, department, category)
         click.echo(f"\n审计报告已导出到: {export}")
 
+    if export_todo:
+        _export_todo_list(export_todo, results)
+        click.echo(f"\n待处理清单已导出到: {export_todo}")
+
 
 def _audit_overdue_repair(conn, days, department, category):
     """审计超期维修中的资产"""
@@ -71,7 +76,7 @@ def _audit_overdue_repair(conn, days, department, category):
     threshold_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
 
     query = '''
-        SELECT a.asset_no, a.name, a.category, a.department, a.status,
+        SELECT a.asset_no, a.name, a.category, a.department, a.status, a.user_name,
                ol.created_at as repair_start, ol.detail as repair_detail
         FROM assets a
         JOIN operation_logs ol ON a.asset_no = ol.asset_no
@@ -113,27 +118,33 @@ def _audit_overdue_repair(conn, days, department, category):
         description = desc_match.group(1).strip() if desc_match else ''
 
         result.append({
+            'type': '超期维修',
             'asset_no': row['asset_no'],
             'name': row['name'],
             'category': row['category'],
             'department': row['department'] or '',
             'status': row['status'],
+            'user_name': row['user_name'] or '',
             'repair_days': repair_days_val,
             'repair_start': start_str,
             'description': description,
+            'suggested_action': '补录维修完成记录，或跟进维修进度',
+            'suggested_batch_op': 'remark',
+            'suggested_value': '维修超期，请跟进',
         })
 
     return result
 
 
 def _audit_long_idle(conn, days, department, category):
-    """审计长期闲置的资产"""
+    """审计长期闲置的资产（闲置状态且无使用人）"""
     cursor = conn.cursor()
     threshold_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
 
     query = '''
         SELECT * FROM assets
         WHERE status = '闲置'
+          AND (user_name IS NULL OR user_name = '')
           AND updated_at <= ?
     '''
     params = [threshold_date]
@@ -160,20 +171,26 @@ def _audit_long_idle(conn, days, department, category):
             idle_days_val = 0
 
         result.append({
+            'type': '长期闲置',
             'asset_no': row['asset_no'],
             'name': row['name'],
             'category': row['category'],
             'department': row['department'] or '',
+            'status': row['status'],
+            'user_name': '',
             'idle_days': idle_days_val,
             'last_user': row['user_name'] or '',
             'last_change': updated_str,
+            'suggested_action': '建议分配给有需要的员工，或评估后报废',
+            'suggested_batch_op': 'remark',
+            'suggested_value': '长期闲置，请安排处理',
         })
 
     return result
 
 
 def _audit_dirty_data(conn, department, category):
-    """审计脏数据"""
+    """审计脏数据，按子类型分类"""
     cursor = conn.cursor()
     issues = []
 
@@ -192,6 +209,8 @@ def _audit_dirty_data(conn, department, category):
     cursor.execute(query1, params)
     for row in cursor.fetchall():
         issues.append({
+            'type': '脏数据-已报废有使用人',
+            'sub_type': '已报废有使用人',
             'asset_no': row['asset_no'],
             'name': row['name'],
             'category': row['category'],
@@ -199,6 +218,9 @@ def _audit_dirty_data(conn, department, category):
             'status': row['status'],
             'user_name': row['user_name'] or '',
             'issue': '已报废但仍有使用人',
+            'suggested_action': '清空使用人，确保报废资产无责任人',
+            'suggested_batch_op': 'remark',
+            'suggested_value': '已清空使用人（脏数据修复）',
         })
 
     query2 = '''
@@ -216,84 +238,99 @@ def _audit_dirty_data(conn, department, category):
     cursor.execute(query2, params2)
     for row in cursor.fetchall():
         issues.append({
+            'type': '脏数据-在用无使用人',
+            'sub_type': '在用无使用人',
             'asset_no': row['asset_no'],
             'name': row['name'],
             'category': row['category'],
             'department': row['department'] or '',
             'status': row['status'],
-            'user_name': row['user_name'] or '',
+            'user_name': '',
             'issue': '在用状态但无使用人',
+            'suggested_action': '补录分配记录，或标记为闲置',
+            'suggested_batch_op': 'remark',
+            'suggested_value': '在用无使用人，请核实',
         })
 
-    issues.sort(key=lambda x: x['asset_no'])
+    issues.sort(key=lambda x: (x['sub_type'], x['asset_no']))
     return issues
 
 
 def _print_overdue_repair(items):
-    click.echo(f"  ▶ 超期维修中资产（{len(items)} 项）")
-    click.echo("  " + "-" * 76)
+    click.echo(f"▶ 超期维修中资产（{len(items)} 项）")
+    click.echo("-" * 90)
     if items:
         rows = []
-        for item in items[:20]:
+        for item in items:
             rows.append([
                 item['asset_no'], item['name'], item['department'],
                 item['repair_days'], item['repair_start'],
-                item['description'] or '-',
+                item['description'] or '-', item['suggested_action'],
             ])
         click.echo(tabulate(rows,
-                            headers=['资产编号', '资产名称', '部门', '维修天数', '开始时间', '故障描述'],
+                            headers=['资产编号', '资产名称', '部门', '维修天数', '开始时间',
+                                     '故障描述', '建议动作'],
                             tablefmt='simple'))
-        if len(items) > 20:
-            click.echo(f"  ... 还有 {len(items) - 20} 条")
     else:
-        click.echo("  （无异常）")
+        click.echo("（无异常）")
     click.echo()
 
 
 def _print_long_idle(items):
-    click.echo(f"  ▶ 长期闲置资产（{len(items)} 项）")
-    click.echo("  " + "-" * 76)
+    click.echo(f"▶ 长期闲置资产（{len(items)} 项）")
+    click.echo("-" * 90)
     if items:
         rows = []
-        for item in items[:20]:
+        for item in items:
             rows.append([
                 item['asset_no'], item['name'], item['department'],
                 item['idle_days'], item['last_user'] or '-',
-                item['last_change'],
+                item['last_change'], item['suggested_action'],
             ])
         click.echo(tabulate(rows,
-                            headers=['资产编号', '资产名称', '部门', '闲置天数', '最后使用人', '最后变更时间'],
+                            headers=['资产编号', '资产名称', '部门', '闲置天数',
+                                     '最后使用人', '最后变更时间', '建议动作'],
                             tablefmt='simple'))
-        if len(items) > 20:
-            click.echo(f"  ... 还有 {len(items) - 20} 条")
     else:
-        click.echo("  （无异常）")
+        click.echo("（无异常）")
     click.echo()
 
 
 def _print_dirty_data(items):
-    click.echo(f"  ▶ 脏数据（{len(items)} 项）")
-    click.echo("  " + "-" * 76)
-    if items:
-        rows = []
-        for item in items[:20]:
-            rows.append([
-                item['asset_no'], item['name'], item['department'],
-                item['status'], item['user_name'] or '-',
-                item['issue'],
-            ])
-        click.echo(tabulate(rows,
-                            headers=['资产编号', '资产名称', '部门', '状态', '使用人', '问题描述'],
-                            tablefmt='simple'))
-        if len(items) > 20:
-            click.echo(f"  ... 还有 {len(items) - 20} 条")
-    else:
-        click.echo("  （无异常）")
-    click.echo()
+    sub_types = {}
+    for item in items:
+        st = item.get('sub_type', '其他')
+        if st not in sub_types:
+            sub_types[st] = []
+        sub_types[st].append(item)
+
+    click.echo(f"▶ 脏数据（{len(items)} 项）")
+    click.echo("-" * 90)
+
+    if not items:
+        click.echo("（无异常）")
+        click.echo()
+        return
+
+    for st, sub_items in sorted(sub_types.items()):
+        click.echo(f"  · {st}（{len(sub_items)} 项）")
+        if sub_items:
+            rows = []
+            for item in sub_items:
+                rows.append([
+                    item['asset_no'], item['name'], item['department'],
+                    item['status'], item['user_name'] or '-',
+                    item['suggested_action'],
+                ])
+            click.echo(tabulate(rows,
+                                headers=['资产编号', '资产名称', '部门', '状态',
+                                         '使用人', '建议动作'],
+                                tablefmt='simple'))
+        click.echo()
 
 
 def _export_audit_results(filepath, fmt, results, repair_days, idle_days, department, category):
-    """导出审计结果"""
+    """导出审计报告"""
     ext = os.path.splitext(filepath)[1].lower()
 
     if fmt == 'xlsx' or ext in ['.xlsx', '.xls']:
@@ -312,46 +349,49 @@ def _export_audit_results(filepath, fmt, results, repair_days, idle_days, depart
             if category:
                 ws.append(['类别', category])
             ws.append([])
-            ws.append(['分类', '数量'])
+            ws.append(['分类', '数量', '建议动作'])
             for section_name, items in [
                 ('超期维修中资产', results.get('overdue_repair', [])),
                 ('长期闲置资产', results.get('long_idle', [])),
                 ('脏数据', results.get('dirty_data', [])),
             ]:
-                ws.append([section_name, len(items)])
+                sample_action = items[0]['suggested_action'] if items else ''
+                ws.append([section_name, len(items), sample_action])
 
             if 'overdue_repair' in results:
                 ws2 = wb.create_sheet('超期维修')
-                ws2.append(['资产编号', '资产名称', '类别', '部门', '状态',
-                            '维修天数', '开始时间', '故障描述'])
+                ws2.append(['资产编号', '资产名称', '类别', '部门', '状态', '使用人',
+                            '维修天数', '开始时间', '故障描述', '建议动作'])
                 for item in results['overdue_repair']:
                     ws2.append([
                         item['asset_no'], item['name'], item['category'],
-                        item['department'], item['status'],
+                        item['department'], item['status'], item['user_name'],
                         item['repair_days'], item['repair_start'],
-                        item['description'],
+                        item['description'], item['suggested_action'],
                     ])
 
             if 'long_idle' in results:
                 ws3 = wb.create_sheet('长期闲置')
                 ws3.append(['资产编号', '资产名称', '类别', '部门',
-                            '闲置天数', '最后使用人', '最后变更时间'])
+                            '闲置天数', '最后使用人', '最后变更时间', '建议动作'])
                 for item in results['long_idle']:
                     ws3.append([
                         item['asset_no'], item['name'], item['category'],
                         item['department'], item['idle_days'],
                         item['last_user'], item['last_change'],
+                        item['suggested_action'],
                     ])
 
             if 'dirty_data' in results:
                 ws4 = wb.create_sheet('脏数据')
                 ws4.append(['资产编号', '资产名称', '类别', '部门',
-                           '状态', '使用人', '问题描述'])
+                            '状态', '使用人', '问题类型', '建议动作'])
                 for item in results['dirty_data']:
                     ws4.append([
                         item['asset_no'], item['name'], item['category'],
                         item['department'], item['status'],
-                        item['user_name'], item['issue'],
+                        item['user_name'], item.get('sub_type', item['type']),
+                        item['suggested_action'],
                     ])
 
             wb.save(filepath)
@@ -373,14 +413,14 @@ def _export_audit_results(filepath, fmt, results, repair_days, idle_days, depart
             if 'overdue_repair' in results:
                 items = results['overdue_repair']
                 writer.writerow([f'=== 超期维修中资产 ({len(items)} 项) ==='])
-                writer.writerow(['资产编号', '资产名称', '类别', '部门', '状态',
-                                '维修天数', '开始时间', '故障描述'])
+                writer.writerow(['资产编号', '资产名称', '类别', '部门', '状态', '使用人',
+                                 '维修天数', '开始时间', '故障描述', '建议动作'])
                 for item in items:
                     writer.writerow([
                         item['asset_no'], item['name'], item['category'],
-                        item['department'], item['status'],
+                        item['department'], item['status'], item['user_name'],
                         item['repair_days'], item['repair_start'],
-                        item['description'],
+                        item['description'], item['suggested_action'],
                     ])
                 writer.writerow([])
 
@@ -388,12 +428,13 @@ def _export_audit_results(filepath, fmt, results, repair_days, idle_days, depart
                 items = results['long_idle']
                 writer.writerow([f'=== 长期闲置资产 ({len(items)} 项) ==='])
                 writer.writerow(['资产编号', '资产名称', '类别', '部门',
-                                '闲置天数', '最后使用人', '最后变更时间'])
+                                 '闲置天数', '最后使用人', '最后变更时间', '建议动作'])
                 for item in items:
                     writer.writerow([
                         item['asset_no'], item['name'], item['category'],
                         item['department'], item['idle_days'],
                         item['last_user'], item['last_change'],
+                        item['suggested_action'],
                     ])
                 writer.writerow([])
 
@@ -401,11 +442,42 @@ def _export_audit_results(filepath, fmt, results, repair_days, idle_days, depart
                 items = results['dirty_data']
                 writer.writerow([f'=== 脏数据 ({len(items)} 项) ==='])
                 writer.writerow(['资产编号', '资产名称', '类别', '部门',
-                               '状态', '使用人', '问题描述'])
+                                 '状态', '使用人', '问题类型', '建议动作'])
                 for item in items:
                     writer.writerow([
                         item['asset_no'], item['name'], item['category'],
                         item['department'], item['status'],
-                        item['user_name'], item['issue'],
+                        item['user_name'], item.get('sub_type', item['type']),
+                        item['suggested_action'],
                     ])
                 writer.writerow([])
+
+
+def _export_todo_list(filepath, results):
+    """导出待处理清单（可直接用于 batch 批量处理）"""
+    todo_items = []
+
+    for section, items in results.items():
+        for item in items:
+            todo_items.append({
+                '异常类型': item['type'],
+                '资产编号': item['asset_no'],
+                '资产名称': item['name'],
+                '类别': item['category'],
+                '部门': item['department'],
+                '当前状态': item['status'],
+                '使用人': item.get('user_name', ''),
+                '问题描述': item.get('description') or item.get('issue') or item.get('type', ''),
+                '建议动作': item['suggested_action'],
+                '建议批量操作': item.get('suggested_batch_op', 'remark'),
+                '建议备注': item.get('suggested_value', ''),
+            })
+
+    if not todo_items:
+        click.echo("\n没有待处理项，跳过导出")
+        return
+
+    with open(filepath, 'w', encoding='utf-8-sig', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=todo_items[0].keys())
+        writer.writeheader()
+        writer.writerows(todo_items)

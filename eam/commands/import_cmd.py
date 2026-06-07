@@ -300,7 +300,7 @@ def import_cmd(filepath, dry_run, operator, mode, check_file_dup):
 
         imported = 0
         updated = 0
-        skipped = 0
+        skipped = len(skip_file_dup)
 
         for asset in new_assets:
             insert_asset(conn, asset)
@@ -334,10 +334,17 @@ def import_cmd(filepath, dry_run, operator, mode, check_file_dup):
     click.echo("=" * 60)
     click.echo("  导入完成")
     click.echo("=" * 60)
+    click.echo(f"  读取总数: {len(normalized_list)} 条")
+    if skip_file_dup:
+        click.echo(f"  文件内重复跳过: {len(skip_file_dup)} 条")
     click.echo(f"  新增: {imported} 条")
     if mode == 'merge-remark':
         click.echo(f"  更新备注: {updated} 条")
-    click.echo(f"  跳过: {skipped} 条")
+        if no_change_assets:
+            click.echo(f"  无变化跳过: {len(no_change_assets)} 条")
+    else:
+        click.echo(f"  跳过重复: {skipped - len(skip_file_dup)} 条")
+    click.echo(f"  总跳过: {skipped} 条")
     click.echo("=" * 60)
 
 

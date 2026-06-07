@@ -57,6 +57,7 @@ def _normalize_task(raw):
     mapping = {
         '操作': 'operation',
         '操作类型': 'operation',
+        '建议批量操作': 'operation',
         '资产编号': 'asset_no',
         '编号': 'asset_no',
         '使用人': 'user_name',
@@ -69,6 +70,7 @@ def _normalize_task(raw):
         '状态': 'status',
         '新状态': 'status',
         '备注': 'remark',
+        '建议备注': 'remark',
         '原因': 'reason',
         '报废原因': 'reason',
     }
@@ -79,6 +81,16 @@ def _normalize_task(raw):
         task[key] = v
 
     return task
+
+
+def _is_audit_csv(tasks):
+    """判断是否是审计导出的待处理清单 CSV"""
+    if not tasks:
+        return False
+    first = tasks[0]
+    audit_keys = ['建议批量操作', '建议备注', '异常类型', '问题描述']
+    found = sum(1 for k in audit_keys if k in first)
+    return found >= 2
 
 
 def _row_to_dict(row):
@@ -308,12 +320,17 @@ def batch_cmd(filepath, dry_run, operator, yes, fail_log, remark):
         click.echo("未读取到任何任务")
         return
 
+    is_audit_source = _is_audit_csv(raw_tasks)
+    if is_audit_source:
+        click.echo("检测到审计待处理清单，将按建议批量操作执行\n")
+
     click.echo(f"读取到 {len(raw_tasks)} 条任务，正在校验...\n")
 
     tasks = []
     for raw in raw_tasks:
         task = _normalize_task(raw)
         task['_line'] = raw.get('_line', '?')
+        task['_raw'] = raw
         tasks.append(task)
 
     with get_db() as conn:
@@ -402,8 +419,16 @@ def batch_cmd(filepath, dry_run, operator, yes, fail_log, remark):
     success_count = 0
     exec_failed = []
 
+    batch_remark = remark or ''
+    if is_audit_source:
+        audit_prefix = '[审计处理]'
+        if batch_remark:
+            batch_remark = audit_prefix + ' ' + batch_remark
+        else:
+            batch_remark = audit_prefix
+
     with get_db() as conn:
-        create_batch_run(conn, batch_no, operator, len(valid_tasks), remark or '')
+        create_batch_run(conn, batch_no, operator, len(valid_tasks), batch_remark)
 
         snapshotted = set()
         for task in valid_tasks:
