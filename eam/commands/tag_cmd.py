@@ -347,31 +347,91 @@ def scrap_cmd(asset_nos, operator, reason, yes):
 
 
 @click.command('idle')
-@click.option('--department', '-d', help='按部门筛选闲置')
-@click.option('--category', '-c', help='按类别筛选闲置')
-@click.option('--mark-idle', is_flag=True, help='将筛选出的资产标记为闲置')
+@click.option('--asset-no', '-n', 'asset_nos', callback=_parse_asset_nos,
+              help='资产编号，多个用逗号分隔')
+@click.option('--department', '-d', help='按部门筛选')
+@click.option('--category', '-c', help='按类别筛选')
+@click.option('--from-status', type=click.Choice(['在用', '维修中', '全部']), default='在用',
+              help='从哪些状态的资产中筛选（默认在用）')
+@click.option('--mark-idle', is_flag=True, help='执行标记为闲置操作（清空使用人）')
 @click.option('--operator', default='system', help='操作人')
+@click.option('--remark', help='闲置原因/备注')
 @click.option('--yes', '-y', is_flag=True, help='跳过确认')
-def idle_cmd(department, category, mark_idle, operator, yes):
-    """查看或标记闲置资产"""
+def idle_cmd(asset_nos, department, category, from_status, mark_idle, operator, remark, yes):
+    """查看或将在用资产批量标记为闲置"""
     with get_db() as conn:
-        filters = {'status': '闲置'}
-        if department:
-            filters['department'] = department
-        if category:
-            filters['category'] = category
+        target_assets = []
 
-        idle_assets = query_assets(conn, filters)
+        if asset_nos:
+            for no in asset_nos:
+                asset = get_asset_by_no(conn, no)
+                if asset:
+                    if from_status == '全部' or asset['status'] == from_status:
+                        target_assets.append(asset)
+                else:
+                    click.echo(f"警告: 资产 {no} 不存在，跳过")
+        else:
+            filters = {}
+            if from_status != '全部':
+                filters['status'] = from_status
+            if department:
+                filters['department'] = department
+            if category:
+                filters['category'] = category
+            target_assets = query_assets(conn, filters)
 
-    if not idle_assets:
-        click.echo("没有闲置资产")
+    if not target_assets:
+        click.echo("没有符合条件的资产")
         return
 
-    click.echo(f"共有 {len(idle_assets)} 项闲置资产:")
+    click.echo(f"找到 {len(target_assets)} 项符合条件的资产"
+               f"（状态: {from_status}）:")
     from tabulate import tabulate
-    rows = [[a['asset_no'], a['name'], a['category'], a['department'] or '-', a['location'] or '-']
-            for a in idle_assets]
-    click.echo(tabulate(rows, headers=['资产编号', '名称', '类别', '部门', '地点'], tablefmt='simple'))
+    rows = [[a['asset_no'], a['name'], a['category'], a['department'] or '-',
+             a['status'], a['user_name'] or '-']
+            for a in target_assets]
+    click.echo(tabulate(rows, headers=['资产编号', '名称', '类别', '部门', '状态', '使用人'],
+                        tablefmt='simple'))
 
-    if mark_idle:
-        click.echo("\n注意: 这些资产已经是闲置状态，无需再次标记。")
+    if not mark_idle:
+        click.echo("\n提示: 加上 --mark-idle 可将这些资产标记为闲置（会清空使用人）")
+        return
+
+    already_idle = sum(1 for a in target_assets if a['status'] == '闲置')
+    to_idle = [a for a in target_assets if a['status'] != '闲置']
+
+    if not to_idle:
+        click.echo("\n所有资产已经是闲置状态，无需操作。")
+        return
+
+    if not yes:
+        click.echo(f"\n将把 {len(to_idle)} 项资产标记为闲置（清空使用人）:")
+        for a in to_idle[:10]:
+            click.echo(f"  {a['asset_no']} - {a['name']} (原使用人: {a['user_name'] or '无'})")
+        if len(to_idle) > 10:
+            click.echo(f"  ... 还有 {len(to_idle) - 10} 项")
+        if not click.confirm("确认标记为闲置?", default=True):
+            click.echo("已取消")
+            return
+
+    with get_db() as conn:
+        success = 0
+        for asset in to_idle:
+            old_status = asset['status']
+            old_user = asset['user_name'] or '无'
+
+            update_data = {'status': '闲置', 'user_name': ''}
+            if remark:
+                update_data['remark'] = (asset['remark'] + '; ' if asset['remark'] else '') + f'闲置原因: {remark}'
+
+            update_asset(conn, asset['asset_no'], update_data)
+            update_asset_timestamp(conn, asset['asset_no'])
+
+            detail = f"从 {old_status} 标记为闲置，原使用人: {old_user}"
+            if remark:
+                detail += f" | 原因: {remark}"
+
+            log_operation(conn, asset['asset_no'], '闲置', operator, detail)
+            success += 1
+
+    click.echo(f"\n操作完成: 成功标记 {success} 项为闲置")

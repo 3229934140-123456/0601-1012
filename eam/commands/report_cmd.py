@@ -498,3 +498,240 @@ def export_cmd(output_file, category, department, status, date_from, date_to, fm
             return
 
     click.echo(f"已导出 {len(assets)} 条资产到 {output_file}")
+
+
+@click.command('monthly-report')
+@click.option('--date-from', help='开始月份 (YYYY-MM)')
+@click.option('--date-to', help='结束月份 (YYYY-MM)')
+@click.option('--months', type=int, help='最近 N 个月')
+@click.option('--export', '-e', help='导出到文件')
+@click.option('--format', '-f', 'fmt', type=click.Choice(['csv', 'xlsx']), default='csv',
+              help='导出格式')
+@click.option('--detail', is_flag=True, help='显示详细分类数据')
+def monthly_report_cmd(date_from, date_to, months, export, fmt, detail):
+    """月度资产变化统计报表"""
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+
+    if months and not date_from:
+        start_date = now - timedelta(days=months * 30)
+        date_from = start_date.strftime('%Y-%m')
+    elif not date_from:
+        date_from = '2020-01'
+
+    if not date_to:
+        date_to = now.strftime('%Y-%m')
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT strftime('%Y-%m', created_at) as month,
+                   COUNT(*) as count,
+                   SUM(purchase_price) as value
+            FROM assets
+            WHERE strftime('%Y-%m', created_at) >= ? AND strftime('%Y-%m', created_at) <= ?
+            GROUP BY month
+            ORDER BY month
+        ''', (date_from, date_to))
+        new_assets = {row['month']: {'count': row['count'], 'value': row['value'] or 0}
+                      for row in cursor.fetchall()}
+
+        operation_stats = {}
+        op_types = ['分配', '归还', '维修发起', '维修完成', '报废', '闲置', '导入更新']
+        for op in op_types:
+            cursor.execute('''
+                SELECT strftime('%Y-%m', created_at) as month,
+                       COUNT(*) as count
+                FROM operation_logs
+                WHERE operation = ?
+                  AND strftime('%Y-%m', created_at) >= ?
+                  AND strftime('%Y-%m', created_at) <= ?
+                GROUP BY month
+                ORDER BY month
+            ''', (op, date_from, date_to))
+            operation_stats[op] = {row['month']: row['count'] for row in cursor.fetchall()}
+
+        cursor.execute('''
+            SELECT strftime('%Y-%m', ol.created_at) as month,
+                   ol.detail
+            FROM operation_logs ol
+            WHERE ol.operation = '维修完成'
+              AND strftime('%Y-%m', ol.created_at) >= ?
+              AND strftime('%Y-%m', ol.created_at) <= ?
+        ''', (date_from, date_to))
+        repair_cost_rows = cursor.fetchall()
+
+        repair_cost_by_month = {}
+        import re
+        cost_pattern = re.compile(r'费用[:：]\s*([\d.]+)')
+        for row in repair_cost_rows:
+            cost = 0
+            match = cost_pattern.search(row['detail'] or '')
+            if match:
+                cost = float(match.group(1))
+            month = row['month']
+            repair_cost_by_month[month] = repair_cost_by_month.get(month, 0) + cost
+
+        cursor.execute('''
+            SELECT strftime('%Y-%m', ol.created_at) as month,
+                   a.purchase_price
+            FROM operation_logs ol
+            JOIN assets a ON ol.asset_no = a.asset_no
+            WHERE ol.operation = '报废'
+              AND strftime('%Y-%m', ol.created_at) >= ?
+              AND strftime('%Y-%m', ol.created_at) <= ?
+        ''', (date_from, date_to))
+        scrap_value_rows = cursor.fetchall()
+
+        scrap_value_by_month = {}
+        for row in scrap_value_rows:
+            month = row['month']
+            scrap_value_by_month[month] = scrap_value_by_month.get(month, 0) + (row['purchase_price'] or 0)
+
+        all_months = set()
+        all_months.update(new_assets.keys())
+        for op_stats in operation_stats.values():
+            all_months.update(op_stats.keys())
+        all_months.update(repair_cost_by_month.keys())
+        all_months = sorted(all_months)
+
+        if not all_months:
+            start = datetime.strptime(date_from, '%Y-%m')
+            end = datetime.strptime(date_to, '%Y-%m')
+            m = start
+            while m <= end:
+                all_months.append(m.strftime('%Y-%m'))
+                if m.month == 12:
+                    m = datetime(m.year + 1, 1, 1)
+                else:
+                    m = datetime(m.year, m.month + 1, 1)
+            all_months = sorted(set(all_months))
+
+        cursor.execute('SELECT COUNT(*) as cnt, SUM(purchase_price) as val FROM assets')
+        total_row = cursor.fetchone()
+        current_total = total_row['cnt']
+        current_value = total_row['val'] or 0
+
+    click.echo("=" * 80)
+    click.echo("  月度资产变化统计报表")
+    click.echo(f"  统计区间: {date_from} ~ {date_to}")
+    click.echo("=" * 80)
+
+    if detail:
+        headers = ['月份', '新增(数量)', '新增(价值)', '分配', '归还',
+                   '维修发起', '维修完成', '维修费用', '报废(数量)', '报废(价值)']
+    else:
+        headers = ['月份', '新增', '分配', '归还', '维修中', '维修费用', '报废', '净变化']
+
+    rows = []
+    cumulative_count = 0
+    cumulative_value = 0
+
+    for month in all_months:
+        new_count = new_assets.get(month, {}).get('count', 0)
+        new_val = new_assets.get(month, {}).get('value', 0)
+        assign_count = operation_stats.get('分配', {}).get(month, 0)
+        return_count = operation_stats.get('归还', {}).get(month, 0)
+        repair_start = operation_stats.get('维修发起', {}).get(month, 0)
+        repair_end = operation_stats.get('维修完成', {}).get(month, 0)
+        repair_cost = repair_cost_by_month.get(month, 0)
+        scrap_count = operation_stats.get('报废', {}).get(month, 0)
+        scrap_val = scrap_value_by_month.get(month, 0)
+        idle_count = operation_stats.get('闲置', {}).get(month, 0)
+
+        net_change = new_count - scrap_count
+
+        if detail:
+            rows.append([
+                month,
+                new_count,
+                f"{new_val:.2f}",
+                assign_count,
+                return_count,
+                repair_start,
+                repair_end,
+                f"{repair_cost:.2f}",
+                scrap_count,
+                f"{scrap_val:.2f}",
+            ])
+        else:
+            in_repair = repair_start - repair_end
+            rows.append([
+                month,
+                new_count,
+                assign_count,
+                return_count,
+                repair_start,
+                f"{repair_cost:.2f}",
+                scrap_count,
+                f"{net_change:+d}",
+            ])
+
+    click.echo(tabulate(rows, headers=headers, tablefmt='simple'))
+
+    click.echo()
+    click.echo("-" * 80)
+    total_new = sum(new_assets.get(m, {}).get('count', 0) for m in all_months)
+    total_new_val = sum(new_assets.get(m, {}).get('value', 0) for m in all_months)
+    total_assign = sum(operation_stats.get('分配', {}).get(m, 0) for m in all_months)
+    total_return = sum(operation_stats.get('归还', {}).get(m, 0) for m in all_months)
+    total_scrap = sum(operation_stats.get('报废', {}).get(m, 0) for m in all_months)
+    total_scrap_val = sum(scrap_value_by_month.get(m, 0) for m in all_months)
+    total_repair_cost = sum(repair_cost_by_month.get(m, 0) for m in all_months)
+
+    click.echo(f"  区间内新增: {total_new} 件 / {total_new_val:.2f} 元")
+    click.echo(f"  区间内报废: {total_scrap} 件 / {total_scrap_val:.2f} 元")
+    click.echo(f"  区间内分配: {total_assign} 次，归还: {total_return} 次")
+    click.echo(f"  区间内维修费用: {total_repair_cost:.2f} 元")
+    click.echo(f"  当前资产总数: {current_total} 件，总值: {current_value:.2f} 元")
+    click.echo("=" * 80)
+
+    if export:
+        if fmt == 'csv':
+            with open(export, 'w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['月度资产变化统计报表', f'{date_from} ~ {date_to}'])
+                writer.writerow([])
+                writer.writerow(headers)
+                writer.writerows(rows)
+                writer.writerow([])
+                writer.writerow(['汇总统计'])
+                writer.writerow(['新增数量', total_new])
+                writer.writerow(['新增价值(元)', f"{total_new_val:.2f}"])
+                writer.writerow(['报废数量', total_scrap])
+                writer.writerow(['报废价值(元)', f"{total_scrap_val:.2f}"])
+                writer.writerow(['分配次数', total_assign])
+                writer.writerow(['归还次数', total_return])
+                writer.writerow(['维修费用(元)', f"{total_repair_cost:.2f}"])
+                writer.writerow(['当前资产总数', current_total])
+                writer.writerow(['当前资产总值(元)', f"{current_value:.2f}"])
+        elif fmt == 'xlsx':
+            try:
+                from openpyxl import Workbook
+                wb = Workbook()
+                ws = wb.active
+                ws.title = '月度变化'
+                ws.append(['月度资产变化统计报表', f'{date_from} ~ {date_to}'])
+                ws.append([])
+                ws.append(headers)
+                for row in rows:
+                    ws.append(row)
+                ws.append([])
+                ws.append(['汇总统计'])
+                ws.append(['新增数量', total_new])
+                ws.append(['新增价值(元)', total_new_val])
+                ws.append(['报废数量', total_scrap])
+                ws.append(['报废价值(元)', total_scrap_val])
+                ws.append(['分配次数', total_assign])
+                ws.append(['归还次数', total_return])
+                ws.append(['维修费用(元)', total_repair_cost])
+                ws.append(['当前资产总数', current_total])
+                ws.append(['当前资产总值(元)', current_value])
+                wb.save(export)
+            except ImportError:
+                click.echo("错误: 需要安装 openpyxl 才能导出 Excel 文件")
+                return
+
+        click.echo(f"\n报表已导出到: {export}")

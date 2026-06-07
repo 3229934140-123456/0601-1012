@@ -1,0 +1,5 @@
+﻿行号,资产编号,操作,失败类型,失败原因
+7,OF-002,status,校验失败,无效状态: 状态变更测试
+8,NOT-EXIST-001,assign,校验失败,资产不存在: NOT-EXIST-001
+2,PC-003,assign,执行失败,执行异常: 'sqlite3.Row' object has no attribute 'get'
+5,PC-006,remark,执行失败,备注操作缺少备注内容

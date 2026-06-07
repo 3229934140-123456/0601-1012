@@ -1,0 +1,9 @@
+operation,asset_no,user_name,department,location,status,remark,reason
+assign,PC-003,测试用户A,测试部,,测试分配,
+return,PC-004,,,,,,
+move,PC-005,,,5楼505室,,移动测试,
+remark,PC-006,,,,批量追加备注测试,
+idle,BADGE-003,,,闲置测试,,
+status,OF-002,,,闲置,状态变更测试,
+assign,NOT-EXIST-001,不存在的资产,,,不存在测试,
+scrap,OF-007,,,,,老旧损坏

@@ -1,0 +1,8 @@
+﻿operation,asset_no,user_name,department,location,status,remark,reason
+assign,PC-001,张三,研发部,,,,
+return,PC-002,,,,,,
+move,PC-003,,,3楼会议室,,,
+scrap,PC-004,,,,,,老旧损坏
+remark,PC-005,,,,,新增备注内容,
+idle,BADGE-001,,,,,离职人员,
+status,OF-001,,,,闲置,,
